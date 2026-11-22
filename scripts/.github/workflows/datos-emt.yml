@@ -1,0 +1,69 @@
+# ------------------------------------------------------------------
+# ACTUALIZACIÓN DE CADA NOCHE — iDriverMadrid (22/11/2026)
+#
+# Vive en el repo PÚBLICO idrivermadrid-data, que es donde se guardan los
+# datos. Pregunta a la EMT (MobilityLabs) por todas las líneas, sus
+# recorridos y sus paradas (scripts/generar-datos-emt.js) y los guarda en
+# este mismo repo, que es de donde los lee la app.
+#
+# Si la EMT falla o da muy pocas líneas, NO se guarda nada y la app sigue
+# con los datos de la noche anterior.
+#
+# Se puede lanzar a mano: pestaña Actions > "Datos EMT (cada noche)" >
+# botón "Run workflow".
+#
+# Secretos que necesita (Settings > Secrets and variables > Actions):
+#   EMT_EMAIL     el correo de la cuenta de MobilityLabs
+#   EMT_PASSWORD  la contraseña de esa cuenta
+# (GitHub nunca enseña los secretos, tampoco en un repo público.)
+# ------------------------------------------------------------------
+name: Datos EMT (cada noche)
+
+on:
+  schedule:
+    # 03:17 UTC = 04:17 en invierno / 05:17 en verano (hora de Madrid)
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: datos-emt
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  datos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Descargar el repo
+        uses: actions/checkout@v4
+
+      - name: Preparar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Pedir los datos a la EMT
+        env:
+          EMT_EMAIL: ${{ secrets.EMT_EMAIL }}
+          EMT_PASSWORD: ${{ secrets.EMT_PASSWORD }}
+          SALIDA_DIR: ${{ runner.temp }}/salida
+        run: node scripts/generar-datos-emt.js
+
+      - name: Guardar los datos nuevos
+        run: |
+          mkdir -p web/parades
+          # Se cambian las paradas enteras: si una línea desaparece, se va también su archivo.
+          rm -f web/parades/*.json
+          cp -r "${{ runner.temp }}/salida/." .
+          git config user.name "iDriverMadrid (datos EMT)"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet -- . ':!resumen.json'; then
+            echo "Sin cambios en recorridos ni paradas: no se guarda nada."
+          else
+            git commit -m "Datos EMT $(date -u +%Y-%m-%d)"
+            git push
+          fi
