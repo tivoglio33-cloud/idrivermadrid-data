@@ -1,0 +1,135 @@
+# ------------------------------------------------------------------
+# GLORIETAS DE MADRID (24/11/2026) — copia del de iDriverBCN
+#
+# Para el Modo discreto: la app necesita saber dónde hay glorietas para
+# dibujarlas y decir por dónde se sale, en vez de "derecha, izquierda,
+# derecha" al rodearlas.
+#
+# Las saca de OpenStreetMap (el mapa libre, que las tiene marcadas como
+# "junction=roundabout") y guarda glorietas.json en ESTE repo de datos
+# (idrivermadrid-data), de donde la web y la app lo descargan solas, sin
+# versión nueva.
+#
+# Las glorietas casi no cambian: se ejecuta solo el día 1 de cada mes, y
+# también a mano: pestaña Actions -> "Glorietas Madrid (OpenStreetMap)" ->
+# Run workflow. No necesita ningún secreto.
+# ------------------------------------------------------------------
+name: Glorietas Madrid (OpenStreetMap)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 2 1 * *'
+
+# El mismo grupo que la actualización de cada noche: así nunca guardan
+# los dos a la vez.
+concurrency:
+  group: datos-emt
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  glorietas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Configurar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Descargar glorietas de OpenStreetMap
+        run: |
+          cat > glorietas.js << 'JSEOF'
+          const fs = require('fs');
+          // Zona: Madrid capital y lo que la rodea (sur, oeste, norte, este).
+          const ZONA = '40.30,-3.85,40.56,-3.52';
+          const QUERY = '[out:json][timeout:180];' +
+            'way["junction"~"^(roundabout|circular)$"]["highway"](' + ZONA + ');' +
+            'out geom;';
+          const SERVIDORES = [
+            'https://overpass-api.de/api/interpreter',
+            'https://overpass.kumi.systems/api/interpreter',
+            'https://overpass.private.coffee/api/interpreter',
+          ];
+          const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          async function pedir() {
+            for (let i = 0; i < 6; i++) {
+              const url = SERVIDORES[i % SERVIDORES.length];
+              try {
+                const r = await fetch(url, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'iDriverMadrid (github.com/tivoglio33-cloud/idrivermadrid-data)' },
+                  body: 'data=' + encodeURIComponent(QUERY),
+                });
+                if (r.ok) return await r.json();
+                console.log('Overpass contestó', r.status, 'en', url);
+              } catch (e) { console.log('Fallo pidiendo a', url, String(e)); }
+              await dormir(20000);
+            }
+            throw new Error('Overpass no responde');
+          }
+
+          function metros(a, b) {
+            const R = 6371000, rad = Math.PI / 180;
+            const dLat = (b[0] - a[0]) * rad, dLon = (b[1] - a[1]) * rad;
+            const x = Math.sin(dLat / 2) ** 2 + Math.cos(a[0] * rad) * Math.cos(b[0] * rad) * Math.sin(dLon / 2) ** 2;
+            return 2 * R * Math.asin(Math.min(1, Math.sqrt(x)));
+          }
+
+          (async () => {
+            const d = await pedir();
+            const vias = (d.elements || []).filter((e) => e.type === 'way' && Array.isArray(e.geometry) && Array.isArray(e.nodes));
+            console.log('Tramos de glorieta recibidos:', vias.length);
+
+            // Una glorieta puede venir partida en varios tramos: se juntan
+            // los tramos que comparten algún nodo.
+            const padre = new Map();
+            const raiz = (x) => { while (padre.get(x) !== x) { padre.set(x, padre.get(padre.get(x))); x = padre.get(x); } return x; };
+            const unir = (a, b) => { const ra = raiz(a), rb = raiz(b); if (ra !== rb) padre.set(ra, rb); };
+            for (const v of vias) for (const n of v.nodes) if (!padre.has(n)) padre.set(n, n);
+            for (const v of vias) for (let i = 1; i < v.nodes.length; i++) unir(v.nodes[0], v.nodes[i]);
+
+            const grupos = new Map();
+            for (const v of vias) {
+              const k = raiz(v.nodes[0]);
+              if (!grupos.has(k)) grupos.set(k, []);
+              for (const g of v.geometry) grupos.get(k).push([g.lat, g.lon]);
+            }
+
+            const lista = [];
+            for (const pts of grupos.values()) {
+              if (pts.length < 3) continue;
+              const c = [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+              const r = pts.reduce((s, p) => s + metros(c, p), 0) / pts.length;
+              // Muy pequeñas (pintadas) o enormes (plazas que no se rodean
+              // como glorieta) no se usan.
+              if (r < 5 || r > 150) continue;
+              lista.push([Number(c[0].toFixed(6)), Number(c[1].toFixed(6)), Math.round(r)]);
+            }
+            lista.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+            console.log('Glorietas guardadas:', lista.length);
+            if (lista.length < 50) throw new Error('Demasiado pocas glorietas: algo ha ido mal, no se guarda');
+            const salida = { generado: new Date().toISOString(), fuente: 'OpenStreetMap (ODbL)', glorietas: lista };
+            fs.writeFileSync('glorietas.json', JSON.stringify(salida));
+          })().catch((e) => { console.error(e); process.exit(1); });
+          JSEOF
+          node glorietas.js
+
+      - name: Guardar glorietas.json
+        # Se guarda con la API de GitHub (gh), sin git: así no hace falta
+        # poner ningún nombre ni correo de quién guarda.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUTA="repos/${{ github.repository }}/contents/glorietas.json"
+          SHA=$(gh api "$RUTA" --jq .sha 2>/dev/null) || SHA=""
+          base64 -w0 glorietas.json > glorietas.b64
+          if [ -n "$SHA" ]; then
+            gh api -X PUT "$RUTA" -f message="Glorietas OpenStreetMap $(date +%F)" -F content=@glorietas.b64 -f sha="$SHA" --jq .commit.sha
+          else
+            gh api -X PUT "$RUTA" -f message="Glorietas OpenStreetMap $(date +%F)" -F content=@glorietas.b64 --jq .commit.sha
+          fi
